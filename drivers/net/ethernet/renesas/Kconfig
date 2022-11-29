@@ -54,6 +54,15 @@ config RENESAS_ETHER_SWITCH
 	  This driver supports the following SoCs:
 		- R8A779Fx.
 
+config RENESAS_FWD_MON
+	tristate "Renesas forward monitoring network device support"
+	depends on RENESAS_ETHER_SWITCH
+	help
+	  This option enables virtual device for monitoring traffic
+	  that is forwarded by MFWD hardware offload.
+	  This driver supports the following SoCs:
+		- R8A779Fx.
+
 config RENESAS_ETHER_SWITCH_XENBACK
 	tristate "Xen PV backend for Renesas Ethernet Switch"
 	depends on RENESAS_ETHER_SWITCH || COMPILE_TEST

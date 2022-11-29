@@ -299,6 +299,9 @@ struct rswitch_private {
 	struct workqueue_struct *rswitch_fib_wq;
 	DECLARE_BITMAP(l23_routing_number, RSWITCH_MAX_NUM_L23);
 	struct reset_control *sd_rst;
+#ifdef CONFIG_RENESAS_FWD_MON
+	int mon_chain;
+#endif
 };
 
 struct rswitch_device {

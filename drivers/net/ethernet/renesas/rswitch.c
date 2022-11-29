@@ -796,6 +796,10 @@ enum rswitch_etha_mode {
 #define LTHSLP0v6 (6)
 /* L3 Routing Valid Learn */
 #define LTHRVL (BIT(15))
+#ifdef CONFIG_RENESAS_FWD_MON
+/* L3 CPU Mirroring Enable Learn */
+#define LTHCMEL (BIT(21))
+#endif
 #define LTHTL (BIT(31))
 #define LTHTS (BIT(31))
 #define LTHTIOG (BIT(0))
@@ -2217,7 +2221,12 @@ static int rswitch_modify_l3fwd(struct l3_ipv4_fwd_param *param, bool delete)
 		rs_write32(param->csd, priv->addr + FWLTHTL80 + 4 * RSWITCH_HW_NUM_TO_GWCA_IDX(priv->gwca.index));
 	else
 		rs_write32(0, priv->addr + FWLTHTL80 + 4 * RSWITCH_HW_NUM_TO_GWCA_IDX(priv->gwca.index));
-	rs_write32(param->dv, priv->addr + FWLTHTL9);
+
+#ifdef CONFIG_RENESAS_FWD_MON
+		rs_write32(param->dv | LTHCMEL, priv->addr + FWLTHTL9);
+#else
+		rs_write32(param->dv, priv->addr + FWLTHTL9);
+#endif
 
 	return rswitch_reg_wait(priv->addr, FWLTHTLR, LTHTL, 0);
 }
@@ -3750,6 +3759,10 @@ static void rswitch_fwd_init(struct rswitch_private *priv)
 
 	/* Enable SC-Tag filtering mode for VLANs */
 	rs_write32(BIT(1), priv->addr + FWGC);
+
+#ifdef CONFIG_RENESAS_FWD_MON
+	rs_write32(priv->mon_chain, priv->addr + FWCMPTC);
+#endif
 }
 
 static int rswitch_init(struct rswitch_private *priv)
