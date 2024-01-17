@@ -117,6 +117,7 @@ static int rswitch_vmq_front_ndev_register(struct rswitch_device *rdev,
 		rdev->port = rdev->priv->gwca.index;
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+	netif_tx_napi_add(ndev, &rdev->tx_napi, rswitch_tx_poll, 64);
 
 	if (!mac)
 		eth_hw_addr_random(ndev);
@@ -148,6 +149,7 @@ out_txdmac:
 	rswitch_rxdmac_free(ndev, NULL);
 
 out_rxdmac:
+	netif_napi_del(&rdev->tx_napi);
 	netif_napi_del(&rdev->napi);
 
 	return err;
@@ -166,7 +168,7 @@ static irqreturn_t rswitch_vmq_front_tx_interrupt(int irq, void *dev_id)
 {
 	struct rswitch_device *rdev = dev_id;
 
-	napi_schedule(&rdev->napi);
+	napi_schedule(&rdev->tx_napi);
 
 	/* TODO: This is better, but there is a possibility for locking issues */
 	/* rswitch_tx_free(rdev->ndev, true); */

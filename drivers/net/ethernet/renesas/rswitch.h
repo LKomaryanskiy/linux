@@ -280,6 +280,7 @@ struct rswitch_device {
 	struct rswitch_private *priv;
 	struct net_device *ndev;
 	struct napi_struct napi;
+	struct napi_struct tx_napi;
 	void __iomem *addr;
 	struct rswitch_gwca_chain *tx_chain;
 	struct rswitch_gwca_chain *rx_default_chain;
@@ -448,6 +449,7 @@ void rswitch_rxdmac_free(struct net_device *ndev, struct rswitch_private *priv);
 void rswitch_ndev_unregister(struct rswitch_device *rdev, int index);
 
 int rswitch_poll(struct napi_struct *napi, int budget);
+int rswitch_tx_poll(struct napi_struct *napi, int budget);
 int rswitch_tx_free(struct net_device *ndev, bool free_txed_only);
 
 void rswitch_gwca_chain_register(struct rswitch_private *priv,

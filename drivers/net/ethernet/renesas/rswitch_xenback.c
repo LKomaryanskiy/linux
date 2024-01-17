@@ -90,6 +90,7 @@ rswitch_vmq_back_ndev_register(struct rswitch_private *priv, int index)
 	ndev->netdev_ops = &rswitch_netdev_ops;
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+	netif_tx_napi_add(ndev, &rdev->tx_napi, rswitch_tx_poll, 64);
 
 	eth_hw_addr_random(ndev);
 
@@ -111,6 +112,7 @@ out_txdmac:
 	rswitch_rxdmac_free(ndev, priv);
 
 out_rxdmac:
+	netif_napi_del(&rdev->tx_napi);
 	netif_napi_del(&rdev->napi);
 	free_netdev(ndev);
 

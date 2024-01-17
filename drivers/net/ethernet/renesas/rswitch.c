@@ -1154,8 +1154,6 @@ void rswitch_enadis_rdev_irqs(struct rswitch_device *rdev, bool enable)
 		if (rdev->rx_learning_chain)
 			rswitch_enadis_data_irq(rdev->priv, rdev->rx_learning_chain->index,
 						enable);
-		rswitch_enadis_data_irq(rdev->priv, rdev->tx_chain->index,
-					enable);
 	} else {
 		if (enable)
 			rswitch_vmq_front_rx_done(rdev);
@@ -1439,6 +1437,31 @@ int rswitch_tx_free(struct net_device *ndev, bool free_txed_only)
 	return free_num;
 }
 
+int rswitch_tx_poll(struct napi_struct *napi, int budget)
+{
+	struct net_device *ndev = napi->dev;
+	struct rswitch_device *rdev = ndev_to_rdev(ndev);
+	struct rswitch_private *priv = rdev->priv;
+	int num;
+	unsigned long flags;
+
+	num = rswitch_tx_free(ndev, true);
+	/* We have free descriptors to process new TX packages */
+	if (budget && napi_complete_done(napi, num)) {
+		if (!rswitch_is_front_dev(rdev)) {
+			spin_lock_irqsave(&priv->lock, flags);
+			rswitch_enadis_data_irq(rdev->priv, rdev->tx_chain->index,
+						true);
+			spin_unlock_irqrestore(&priv->lock, flags);
+		} else {
+			rswitch_vmq_front_trigger_tx(rdev);
+		}
+	}
+	netif_wake_subqueue(ndev, 0);
+
+	return min(num, budget - 1);
+}
+
 int rswitch_poll(struct napi_struct *napi, int budget)
 {
 	struct net_device *ndev = napi->dev;
@@ -1448,7 +1471,6 @@ int rswitch_poll(struct napi_struct *napi, int budget)
 	int quota = budget;
 
 retry:
-	rswitch_tx_free(ndev, true);
 
 	if (rswitch_rx(ndev, &quota))
 		goto out;
@@ -1456,8 +1478,6 @@ retry:
 		goto retry;
 	else if (rdev->rx_learning_chain && rswitch_is_chain_rxed(rdev->rx_learning_chain, DT_FEMPTY))
 		goto retry;
-
-	netif_wake_subqueue(ndev, 0);
 
 	if (napi_complete_done(napi, budget - quota)) {
 		spin_lock_irqsave(&priv->lock, flags);
@@ -2232,6 +2252,7 @@ static int rswitch_open(struct net_device *ndev)
 	unsigned long flags;
 
 	napi_enable(&rdev->napi);
+	napi_enable(&rdev->tx_napi);
 
 	if (!parallel_mode && rdev->etha) {
 		if (!rdev->etha->operated) {
@@ -2311,6 +2332,7 @@ error:
 		phy_stop(ndev->phydev);
 	rswitch_phy_deinit(rdev);
 	rswitch_mii_unregister(rdev);
+	napi_disable(&rdev->tx_napi);
 	napi_disable(&rdev->napi);
 	goto out;
 };
@@ -2324,6 +2346,7 @@ static int rswitch_stop(struct net_device *ndev)
 		phy_stop(ndev->phydev);
 
 	napi_disable(&rdev->napi);
+	napi_disable(&rdev->tx_napi);
 
 	if (!rswitch_is_front_dev(rdev)) {
 		rdev->priv->chan_running &= ~BIT(rdev->port);
@@ -4190,6 +4213,7 @@ static int rswitch_ndev_create(struct rswitch_private *priv, int index, bool rmo
 	ndev->netdev_ops = &rswitch_netdev_ops;
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+	netif_tx_napi_add(ndev, &rdev->tx_napi, rswitch_tx_poll, 64);
 
 	/* FIXME: it seems S4 VPF has FWPBFCSDC0/1 only so that we cannot set
 	 * CSD = 1 (rx_default_chain->index = 1) for FWPBFCS03. So, use index = 0
@@ -4236,6 +4260,7 @@ out_txdmac:
 	rswitch_rxdmac_free(ndev, priv);
 
 out_rxdmac:
+	netif_napi_del(&rdev->tx_napi);
 	netif_napi_del(&rdev->napi);
 	free_netdev(ndev);
 
@@ -4277,12 +4302,39 @@ static void rswitch_coma_init(struct rswitch_private *priv)
 	iowrite32(CABPPFLC_INIT_VALUE, priv->addr + CABPPFLC0);
 }
 
-static void rswitch_queue_interrupt(struct rswitch_device *rdev)
+static void rswitch_queue_rmon_interrupt(struct rswitch_gwca_chain *c)
 {
-	if (!rdev->mondev) {
-		if (napi_schedule_prep(&rdev->napi)) {
+	struct rswitch_device *rdev = c->rdev;
+	struct rswitch_private *priv = rdev->priv;
+	int i;
+
+	/* Schedule napi for all rmon devices as they share the same chain. */
+	for (i = 0; i < RSWITCH_MAX_RMON_DEV; i++) {
+		if (priv->rmon_dev[i] && napi_schedule_prep(&priv->rmon_dev[i]->napi)) {
+			spin_lock(&rdev->priv->lock);
+			rswitch_enadis_data_irq(priv->rmon_dev[i]->priv,
+						priv->rmon_dev[i]->rx_default_chain->index,
+						false);
+			spin_unlock(&rdev->priv->lock);
+			__napi_schedule(&priv->rmon_dev[i]->napi);
+		}
+	}
+}
+
+static void rswitch_queue_rdev_interrupt(struct rswitch_gwca_chain *c)
+{
+	struct rswitch_device *rdev = c->rdev;
+
+	if (c->dir_tx) {
+		if (napi_schedule_prep(&rdev->tx_napi)) {
 			spin_lock(&rdev->priv->lock);
 			rswitch_enadis_data_irq(rdev->priv, rdev->tx_chain->index, false);
+			spin_unlock(&rdev->priv->lock);
+			__napi_schedule(&rdev->tx_napi);
+		}
+	} else {
+		if (napi_schedule_prep(&rdev->napi)) {
+			spin_lock(&rdev->priv->lock);
 			rswitch_enadis_data_irq(rdev->priv, rdev->rx_default_chain->index, false);
 			if (rdev->rx_learning_chain) {
 				rswitch_enadis_data_irq(rdev->priv,
@@ -4291,23 +4343,18 @@ static void rswitch_queue_interrupt(struct rswitch_device *rdev)
 			spin_unlock(&rdev->priv->lock);
 			__napi_schedule(&rdev->napi);
 		}
-	} else {
-		struct rswitch_private *priv = rdev->priv;
-		int i;
+	}
+	
+}
 
-		/* Schedule napi for all rmon devices as
-		 * they share the same chain.
-		 */
-		for (i = 0; i < RSWITCH_MAX_RMON_DEV; i++) {
-			if (priv->rmon_dev[i] && napi_schedule_prep(&priv->rmon_dev[i]->napi)) {
-				spin_lock(&rdev->priv->lock);
-				rswitch_enadis_data_irq(priv->rmon_dev[i]->priv,
-							priv->rmon_dev[i]->rx_default_chain->index,
-							false);
-				spin_unlock(&rdev->priv->lock);
-				__napi_schedule(&priv->rmon_dev[i]->napi);
-			}
-		}
+static void rswitch_queue_interrupt(struct rswitch_gwca_chain *c)
+{
+	struct rswitch_device *rdev = c->rdev;
+
+	if (!rdev->mondev) {
+		rswitch_queue_rdev_interrupt(c);
+	} else {
+		rswitch_queue_rmon_interrupt(c);
 	}
 }
 
@@ -4326,7 +4373,7 @@ static irqreturn_t __maybe_unused rswitch_data_irq(struct rswitch_private *priv,
 
 		rswitch_ack_data_irq(priv, c->index);
 		if (!c->back_info)
-			rswitch_queue_interrupt(c->rdev);
+			rswitch_queue_interrupt(c);
 		else
 			rswitch_vmq_back_data_irq(c);
 	}
@@ -4977,8 +5024,10 @@ static int vlan_dev_register(struct net_device *ndev)
 		goto err_rx;
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+	netif_tx_napi_add(ndev, &rdev->tx_napi, rswitch_tx_poll, 64);
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
 	napi_enable(&rdev->napi);
+	napi_enable(&rdev->tx_napi);
 	return 0;
 err_rx:
 	rswitch_txdmac_free(ndev, priv);
@@ -5037,6 +5086,8 @@ static void vlan_dev_unregister(struct net_device *ndev)
 	rdev = ndev_to_rdev(ndev);
 	rswitch_rxdmac_free(ndev, priv);
 	rswitch_txdmac_free(ndev, priv);
+	napi_disable(&rdev->tx_napi);
+	netif_napi_del(&rdev->tx_napi);
 	napi_disable(&rdev->napi);
 	netif_napi_del(&rdev->napi);
 
