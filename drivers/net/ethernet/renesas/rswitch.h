@@ -209,8 +209,8 @@ struct rswitch_gwca_chain {
 #define RSWITCH_MAX_NUM_NDEV	8
 #define RSWITCH_MAX_NUM_L23	256
 
-#define TX_RING_SIZE		1024
-#define RX_RING_SIZE		1024
+#define TX_RING_SIZE		10240
+#define RX_RING_SIZE		10240
 
 #define RSWITCH_ALIGN		128
 #define RSWITCH_MAX_CTAG_PCP	7
@@ -275,11 +275,18 @@ struct rswitch_filters {
 	DECLARE_BITMAP(cascade, PFL_CADF_N);
 };
 
+struct rswitch_vmq_status {
+	uint64_t front_tx, front_rx;
+	uint64_t back_tx, back_rx;
+	uint64_t tx_ring_size, rx_ring_size;
+};
+
 struct rswitch_device {
 	struct list_head list;
 	struct rswitch_private *priv;
 	struct net_device *ndev;
 	struct napi_struct napi;
+	struct napi_struct tx_napi;
 	void __iomem *addr;
 	struct rswitch_gwca_chain *tx_chain;
 	struct rswitch_gwca_chain *rx_default_chain;
@@ -307,6 +314,8 @@ struct rswitch_device {
 	 */
 	struct device *vlan_parent;
 	bool mondev;
+	struct rswitch_vmq_status *vmq_info;
+	bool is_vmq;
 };
 
 struct rswitch_private {
@@ -448,6 +457,7 @@ void rswitch_rxdmac_free(struct net_device *ndev, struct rswitch_private *priv);
 void rswitch_ndev_unregister(struct rswitch_device *rdev, int index);
 
 int rswitch_poll(struct napi_struct *napi, int budget);
+int rswitch_tx_poll(struct napi_struct *napi, int budget);
 int rswitch_tx_free(struct net_device *ndev, bool free_txed_only);
 
 void rswitch_gwca_chain_register(struct rswitch_private *priv,

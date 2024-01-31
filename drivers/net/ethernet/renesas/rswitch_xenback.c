@@ -82,6 +82,9 @@ rswitch_vmq_back_ndev_register(struct rswitch_private *priv, int index)
 	spin_lock_init(&rdev->lock);
 
 	INIT_LIST_HEAD(&rdev->routing_list);
+#if IS_ENABLED(CONFIG_IP_MROUTE)
+	INIT_LIST_HEAD(&rdev->mult_routing_list);
+#endif
 
 	ndev->features = NETIF_F_RXCSUM;
 	ndev->hw_features = NETIF_F_RXCSUM;
@@ -90,6 +93,7 @@ rswitch_vmq_back_ndev_register(struct rswitch_private *priv, int index)
 	ndev->netdev_ops = &rswitch_netdev_ops;
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+	netif_tx_napi_add(ndev, &rdev->tx_napi, rswitch_tx_poll, 64);
 
 	eth_hw_addr_random(ndev);
 
@@ -102,6 +106,8 @@ rswitch_vmq_back_ndev_register(struct rswitch_private *priv, int index)
 	if (err < 0)
 		goto out_txdmac;
 
+	rdev->is_vmq = true;
+
 	/* Print device information */
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
 
@@ -111,6 +117,7 @@ out_txdmac:
 	rswitch_rxdmac_free(ndev, priv);
 
 out_rxdmac:
+	netif_napi_del(&rdev->tx_napi);
 	netif_napi_del(&rdev->napi);
 	free_netdev(ndev);
 
@@ -212,9 +219,6 @@ static int rswitch_vmq_back_probe(struct xenbus_device *dev,
 	be->tx_chain->osid = be->osid;
 	be->rx_chain->osid = be->osid;
 
-	rswitch_gwca_chain_set_irq_delay(priv, be->tx_chain, chain_irq_delay);
-	rswitch_gwca_chain_set_irq_delay(priv, be->rx_chain, chain_irq_delay);
-
 	snprintf(be->name, sizeof(be->name) - 1, "rswitch-vmq-osid%d", be->osid);
 
 	be->if_num = xenbus_read_unsigned(dev->otherend, "if-num", 255);
@@ -232,6 +236,8 @@ static int rswitch_vmq_back_probe(struct xenbus_device *dev,
 					 err);
 			goto fail;
 		}
+		rswitch_gwca_chain_set_irq_delay(priv, be->tx_chain, chain_irq_delay);
+		rswitch_gwca_chain_set_irq_delay(priv, be->rx_chain, chain_irq_delay);
 	}
 	else if (strcmp(type_str, "tsn") == 0) {
 		struct rswitch_device *rdev = rswitch_find_rdev_by_port(be->rswitch_priv,
@@ -249,6 +255,8 @@ static int rswitch_vmq_back_probe(struct xenbus_device *dev,
 			err = -ENODEV;
 			goto fail;
 		}
+		rswitch_gwca_chain_set_irq_delay(priv, be->tx_chain, 0);
+		rswitch_gwca_chain_set_irq_delay(priv, be->rx_chain, 0);
 
 		be->type = RSWITCH_PV_TSN;
 		netif_dormant_on(rdev->ndev);
@@ -371,11 +379,15 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 	struct rswitch_vmq_back_info *be = dev_get_drvdata(&dev->dev);
 	unsigned int tx_evt;
 	unsigned int rx_evt;
+	unsigned int gref;
 	int err;
+	struct gnttab_map_grant_ref map;
+	struct page *page;
 
 	err = xenbus_gather(XBT_NIL, dev->otherend,
 			    "tx-evtch", "%u", &tx_evt,
 			    "rx-evtch", "%u", &rx_evt,
+			    "gref", "%u", &gref,
 			    NULL);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "Failed to read front-end info: %d", err);
@@ -422,6 +434,22 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 		WARN(1, "Unknown rswitch be->type: %d\n", be->type);
 		err = -ENODEV;
 		break;
+	}
+
+
+	err = gnttab_alloc_pages(1, &page);
+	if (err) {
+		pr_err("Failed to allocate GNT page %d\n", err);
+		return err;
+	}
+
+	gnttab_set_map_op(&map, (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((page))),
+			  GNTMAP_host_map, gref, dev->otherend_id);
+	err = gnttab_map_refs(&map, NULL, &page, 1);
+	if (err) {
+		pr_err("Failed to map grant refs %d\n", err);
+	} else {
+		be->rdev->vmq_info = (struct rswitch_vmq_status *)page_address(page);
 	}
 
 	return err;

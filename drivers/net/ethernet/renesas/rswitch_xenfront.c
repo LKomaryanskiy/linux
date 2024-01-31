@@ -117,6 +117,7 @@ static int rswitch_vmq_front_ndev_register(struct rswitch_device *rdev,
 		rdev->port = rdev->priv->gwca.index;
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
+	netif_tx_napi_add(ndev, &rdev->tx_napi, rswitch_tx_poll, 64);
 
 	if (!mac)
 		eth_hw_addr_random(ndev);
@@ -138,6 +139,7 @@ static int rswitch_vmq_front_ndev_register(struct rswitch_device *rdev,
 
 	/* Print device information */
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
+	rdev->is_vmq = true;
 
 	return 0;
 
@@ -148,6 +150,7 @@ out_txdmac:
 	rswitch_rxdmac_free(ndev, NULL);
 
 out_rxdmac:
+	netif_napi_del(&rdev->tx_napi);
 	netif_napi_del(&rdev->napi);
 
 	return err;
@@ -166,7 +169,7 @@ static irqreturn_t rswitch_vmq_front_tx_interrupt(int irq, void *dev_id)
 {
 	struct rswitch_device *rdev = dev_id;
 
-	napi_schedule(&rdev->napi);
+	napi_schedule(&rdev->tx_napi);
 
 	/* TODO: This is better, but there is a possibility for locking issues */
 	/* rswitch_tx_free(rdev->ndev, true); */
@@ -198,6 +201,7 @@ static int rswitch_vmq_front_connect(struct net_device *dev)
 	char *type;
 	char *mac_str;
 	u8 mac[ETH_ALEN];
+	int ret, gref;
 
 	tx_chain_id = xenbus_read_unsigned(np->xbdev->otherend,
 					   "tx-chain-id", 0);
@@ -236,7 +240,24 @@ static int rswitch_vmq_front_connect(struct net_device *dev)
 
 	err = rswitch_vmq_front_ndev_register(rdev, type, index, tx_chain_id,
 					      rx_chain_id, mac_str ? mac : NULL);
+
+	rdev->vmq_info = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	/* TODO: correct process error */
+	if (!rdev->vmq_info) {
+		pr_err("rdev->rswitch_vmq_status ERROR\n");
+		return -1;
+	}
+
+	gref = gnttab_grant_foreign_access(np->xbdev->otherend_id,
+	                                   virt_to_gfn(rdev->vmq_info), 0);
 	kfree(type);
+
+	WRITE_ONCE(rdev->vmq_info->front_tx, 0);
+	WRITE_ONCE(rdev->vmq_info->front_rx, 0);
+	WRITE_ONCE(rdev->vmq_info->back_tx, 0);
+	WRITE_ONCE(rdev->vmq_info->back_rx, 0);
+	WRITE_ONCE(rdev->vmq_info->tx_ring_size, RX_RING_SIZE);
+	WRITE_ONCE(rdev->vmq_info->rx_ring_size, TX_RING_SIZE);
 
 	if (mac_str)
 		kfree(mac_str);
@@ -289,6 +310,14 @@ static int rswitch_vmq_front_connect(struct net_device *dev)
 	}
 
 	err = xenbus_printf(XBT_NIL, np->xbdev->nodename, "tx-evtch", "%u", np->tx_evtchn);
+	if (err) {
+		xenbus_dev_fatal(np->xbdev, err,
+				 "Failed to write TX event channel id: %d\n", err);
+		return err;
+	}
+
+	ret = xenbus_printf(XBT_NIL, np->xbdev->nodename, "gref",
+			    "%u", gref);
 	if (err) {
 		xenbus_dev_fatal(np->xbdev, err,
 				 "Failed to write TX event channel id: %d\n", err);
