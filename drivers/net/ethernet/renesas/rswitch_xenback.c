@@ -44,6 +44,8 @@ struct rswitch_vmq_back_info {
 	uint32_t osid;
 	uint32_t if_num;
 	enum rswtich_pv_type type;
+	int gref;
+	struct page *shared_page;
 };
 
 /* Optimal value between performance and event numbers for front devices */
@@ -102,6 +104,8 @@ rswitch_vmq_back_ndev_register(struct rswitch_private *priv, int index)
 	if (err < 0)
 		goto out_txdmac;
 
+	rdev->is_vmq = true;
+
 	/* Print device information */
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
 
@@ -137,6 +141,15 @@ static int rswitch_vmq_back_remove(struct xenbus_device *dev)
 		rswitch_vmq_back_disconnect(dev);
 		rswitch_ndev_unregister(be->rdev, -1);
 		be->rdev = NULL;
+		if (be->type == RSWITCH_PV_VMQ) {
+			struct gnttab_unmap_grant_ref unmap_op;
+
+			gnttab_set_unmap_op(&unmap_op,
+			    		    (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((be->shared_page))),
+				  	    GNTMAP_host_map, be->gref);
+			gnttab_unmap_refs(&unmap_op, NULL, &be->shared_page, 1);
+			gnttab_free_pages(1, &be->shared_page);
+		}
 	}
 
 	if (be->rx_chain)
@@ -373,10 +386,12 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 	unsigned int tx_evt;
 	unsigned int rx_evt;
 	int err;
+	struct gnttab_map_grant_ref grant_map;
 
 	err = xenbus_gather(XBT_NIL, dev->otherend,
 			    "tx-evtch", "%u", &tx_evt,
 			    "rx-evtch", "%u", &rx_evt,
+			    "gref", "%u", &be->gref,
 			    NULL);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "Failed to read front-end info: %d", err);
@@ -418,6 +433,27 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 			dev_err(&dev->dev, "failed to register ndev\n");
 			goto err_unbind_rx_evt;
 		}
+
+		err = gnttab_alloc_pages(1, &be->shared_page);
+		if (err) {
+			dev_err(&be->rdev->ndev->dev, "failed to allocate gnttab page (err=%d)\n", err);
+			goto err_unregister_ndev;
+		}
+
+		gnttab_set_map_op(&grant_map,
+				  (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((be->shared_page))),
+				  GNTMAP_host_map, be->gref, dev->otherend_id);
+		err = gnttab_map_refs(&grant_map, NULL, &be->shared_page, 1);
+		if (err) {
+			dev_err(&be->rdev->ndev->dev, "failed to map grant refs %d\n", err);
+			goto err_gnttab_free_page;
+		}
+
+		be->rdev->vmq_info = (struct rswitch_vmq_status *)page_address(be->shared_page);
+		WRITE_ONCE(be->rdev->vmq_info->back_tx, 0);
+		WRITE_ONCE(be->rdev->vmq_info->back_rx, 0);
+		WRITE_ONCE(be->rdev->vmq_info->tx_back_ring_size, RX_RING_SIZE);
+		WRITE_ONCE(be->rdev->vmq_info->rx_back_ring_size, TX_RING_SIZE);
 		break;
 	case RSWITCH_PV_TSN:
 		rswitch_mfwd_set_port_based(be->rswitch_priv, be->if_num, be->rx_chain);
@@ -431,6 +467,10 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 
 	return err;
 
+err_gnttab_free_page:
+	gnttab_free_pages(1, &be->shared_page);
+err_unregister_ndev:
+	rswitch_ndev_unregister(be->rdev, -1);
 err_unbind_rx_evt:
 	unbind_from_irqhandler(be->rx_irq, be);
 	be->rx_irq = 0;

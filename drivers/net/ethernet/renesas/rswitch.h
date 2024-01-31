@@ -274,6 +274,13 @@ struct rswitch_filters {
 	DECLARE_BITMAP(cascade, PFL_CADF_N);
 };
 
+struct rswitch_vmq_status {
+	uint64_t front_tx, front_rx;
+	uint64_t back_tx, back_rx;
+	uint64_t tx_front_ring_size, rx_front_ring_size;
+	uint64_t tx_back_ring_size, rx_back_ring_size;
+};
+
 struct rswitch_device {
 	struct list_head list;
 	struct rswitch_private *priv;
@@ -306,6 +313,8 @@ struct rswitch_device {
 	 */
 	struct device *vlan_parent;
 	bool mondev;
+	struct rswitch_vmq_status *vmq_info;
+	bool is_vmq;
 };
 
 struct rswitch_private {

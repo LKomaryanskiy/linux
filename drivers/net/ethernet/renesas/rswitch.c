@@ -1186,6 +1186,7 @@ static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch
 	struct rswitch_device *rdev = ndev_to_rdev(ndev);
 	struct rswitch_private *priv = rdev->priv;
 	int boguscnt = c->dirty + c->num_ring - c->cur;
+	int rx_counter = 0;
 	int entry = c->cur % c->num_ring;
 	struct rswitch_ext_ts_desc *desc = &c->rx_ring[entry];
 	int limit;
@@ -1193,6 +1194,7 @@ static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch
 	struct sk_buff *skb;
 	dma_addr_t dma_addr;
 	u32 get_ts;
+	u64 rxed = 0;
 
 	boguscnt = min(boguscnt, *quota);
 	limit = boguscnt;
@@ -1329,6 +1331,8 @@ static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch
 		rdev->ndev->stats.rx_bytes += pkt_len;
 
 next:
+		if (rdev->is_vmq)
+			rx_counter++;
 		c->rx_bufs[entry] = NULL;
 		entry = (++c->cur) % c->num_ring;
 		desc = &c->rx_ring[entry];
@@ -1358,6 +1362,19 @@ next:
 		dma_wmb();
 		desc->die_dt = DT_FEMPTY | DIE;
 	}
+
+	if (rdev->is_vmq) {
+		if (rswitch_is_front_dev(rdev)) {
+			rxed = READ_ONCE(rdev->vmq_info->front_rx);
+			rxed += rx_counter;
+			WRITE_ONCE(rdev->vmq_info->front_rx, rxed);
+		} else {
+			rxed = READ_ONCE(rdev->vmq_info->back_rx);
+			rxed += rx_counter;
+			WRITE_ONCE(rdev->vmq_info->back_rx, rxed);
+		}
+	}
+	
 
 	*quota -= limit - (++boguscnt);
 
@@ -2391,6 +2408,8 @@ static int rswitch_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	unsigned long flags;
 	struct rswitch_gwca_chain *c = rdev->tx_chain;
 	int i, num_desc, pkt_len, size;
+	int rx_chain_free;
+	u64 txed;
 
 	spin_lock_irqsave(&rdev->lock, flags);
 
@@ -2400,6 +2419,22 @@ static int rswitch_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		netif_stop_subqueue(ndev, 0);
 		ret = NETDEV_TX_BUSY;
 		goto out;
+	}
+
+	if (rdev->is_vmq) {
+		if (rswitch_is_front_dev(rdev)) {
+			rx_chain_free = READ_ONCE(rdev->vmq_info->rx_back_ring_size) -
+					(READ_ONCE(rdev->vmq_info->front_tx) -
+					READ_ONCE(rdev->vmq_info->back_rx));
+		} else {
+			rx_chain_free = READ_ONCE(rdev->vmq_info->rx_front_ring_size) -
+				        (READ_ONCE(rdev->vmq_info->back_tx) -
+					READ_ONCE(rdev->vmq_info->front_rx));
+		}
+		if (num_desc > rx_chain_free) {
+			ret = NETDEV_TX_BUSY;
+			goto out;
+		}
 	}
 
 	if (skb_put_padto(skb, ETH_ZLEN))
@@ -2483,6 +2518,18 @@ static int rswitch_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	} else {
 		desc = &c->tx_ring[entry];
 		desc->die_dt = DT_FSINGLE | DIE;
+	}
+
+	if (rdev->is_vmq) {
+		if (rswitch_is_front_dev(rdev)) {
+			txed = READ_ONCE(rdev->vmq_info->front_tx);
+			txed += num_desc;
+			WRITE_ONCE(rdev->vmq_info->front_tx, txed);
+		} else {
+			txed = READ_ONCE(rdev->vmq_info->back_tx);
+			txed += num_desc;
+			WRITE_ONCE(rdev->vmq_info->back_tx, txed);
+		}
 	}
 
 	c->cur += num_desc;
@@ -4048,6 +4095,7 @@ int rswitch_rxdmac_init(struct net_device *ndev, struct rswitch_private *priv,
 				      RX_RING_SIZE);
 	if (err < 0)
 		goto put_learning;
+	
 	err = rswitch_gwca_chain_init(ndev, priv, rdev->rx_learning_chain, false,
 				      RX_RING_SIZE);
 	if (err < 0)
@@ -4056,6 +4104,7 @@ int rswitch_rxdmac_init(struct net_device *ndev, struct rswitch_private *priv,
 	err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_default_chain);
 	if (err < 0)
 		goto free_learning;
+
 	err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_learning_chain);
 	if (err < 0)
 		goto free_learning;
@@ -4210,6 +4259,8 @@ static int rswitch_ndev_create(struct rswitch_private *priv, int index, bool rmo
 			rdev->tx_chain = priv->mon_tx_chain;
 		}
 	}
+
+	rdev->is_vmq = false;
 
 	/* Print device information */
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
@@ -4965,6 +5016,7 @@ static int vlan_dev_register(struct net_device *ndev)
 
 	netif_napi_add(ndev, &rdev->napi, rswitch_poll, 64);
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
+	rdev->is_vmq = false;
 	napi_enable(&rdev->napi);
 	return 0;
 err_rx:
