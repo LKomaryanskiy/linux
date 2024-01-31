@@ -4116,7 +4116,7 @@ int rswitch_rxdmac_init(struct net_device *ndev, struct rswitch_private *priv,
 		rdev->rx_default_chain = rswitch_gwca_get(priv);
 		if (!rdev->rx_default_chain)
 			return -EBUSY;
-		if (!parallel_mode) {
+		if (!parallel_mode && !rdev->is_vmq) {
 			rdev->rx_learning_chain = rswitch_gwca_get(priv);
 			if (!rdev->rx_learning_chain)
 				goto put_default;
@@ -4136,27 +4136,35 @@ int rswitch_rxdmac_init(struct net_device *ndev, struct rswitch_private *priv,
 	if (err < 0)
 		goto put_learning;
 	
-	err = rswitch_gwca_chain_init(ndev, priv, rdev->rx_learning_chain, false,
-				      RX_RING_SIZE);
-	if (err < 0)
-		goto free_default;
+	if (!rdev->is_vmq) {
+		err = rswitch_gwca_chain_init(ndev, priv, rdev->rx_learning_chain, false,
+					      RX_RING_SIZE);
+		if (err < 0)
+			goto free_default;
+	}
 
 	err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_default_chain);
 	if (err < 0)
 		goto free_learning;
 
-	err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_learning_chain);
-	if (err < 0)
-		goto free_learning;
+	if (!rdev->is_vmq) {
+		err = rswitch_gwca_chain_ext_ts_format(ndev, priv, rdev->rx_learning_chain);
+		if (err < 0)
+			goto free_learning;
+	} else {
+		rdev->rx_learning_chain = NULL;
+	}
 
 	return 0;
 
 free_learning:
-	rswitch_gwca_chain_free(ndev, priv, rdev->rx_learning_chain);
+	if (!rdev->is_vmq)
+		rswitch_gwca_chain_free(ndev, priv, rdev->rx_learning_chain);
 free_default:
 	rswitch_gwca_chain_free(ndev, priv, rdev->rx_default_chain);
 put_learning:
-	rswitch_gwca_put(priv, rdev->rx_learning_chain);
+	if (!rdev->is_vmq)
+		rswitch_gwca_put(priv, rdev->rx_learning_chain);
 put_default:
 	rswitch_gwca_put(priv, rdev->rx_default_chain);
 
