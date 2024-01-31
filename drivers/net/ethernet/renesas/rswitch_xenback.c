@@ -103,6 +103,8 @@ rswitch_vmq_back_ndev_register(struct rswitch_private *priv, int index)
 	if (err < 0)
 		goto out_txdmac;
 
+	rdev->is_vmq = true;
+
 	/* Print device information */
 	netdev_info(ndev, "MAC address %pMn", ndev->dev_addr);
 
@@ -374,11 +376,15 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 	struct rswitch_vmq_back_info *be = dev_get_drvdata(&dev->dev);
 	unsigned int tx_evt;
 	unsigned int rx_evt;
+	unsigned int gref;
 	int err;
+	struct gnttab_map_grant_ref map;
+	struct page *page;
 
 	err = xenbus_gather(XBT_NIL, dev->otherend,
 			    "tx-evtch", "%u", &tx_evt,
 			    "rx-evtch", "%u", &rx_evt,
+			    "gref", "%u", &gref,
 			    NULL);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "Failed to read front-end info: %d", err);
@@ -425,6 +431,22 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 		WARN(1, "Unknown rswitch be->type: %d\n", be->type);
 		err = -ENODEV;
 		break;
+	}
+
+
+	err = gnttab_alloc_pages(1, &page);
+	if (err) {
+		pr_err("Failed to allocate GNT page %d\n", err);
+		return err;
+	}
+
+	gnttab_set_map_op(&map, (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((page))),
+			  GNTMAP_host_map, gref, dev->otherend_id);
+	err = gnttab_map_refs(&map, NULL, &page, 1);
+	if (err) {
+		pr_err("Failed to map grant refs %d\n", err);
+	} else {
+		be->rdev->vmq_info = (struct rswitch_vmq_status *)page_address(page);
 	}
 
 	return err;
