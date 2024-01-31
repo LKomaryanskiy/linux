@@ -209,8 +209,8 @@ struct rswitch_gwca_chain {
 #define RSWITCH_MAX_NUM_NDEV	8
 #define RSWITCH_MAX_NUM_L23	256
 
-#define TX_RING_SIZE		1024
-#define RX_RING_SIZE		1024
+#define TX_RING_SIZE		10240
+#define RX_RING_SIZE		10240
 
 #define RSWITCH_ALIGN		128
 #define RSWITCH_MAX_CTAG_PCP	7
