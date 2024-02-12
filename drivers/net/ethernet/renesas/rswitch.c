@@ -1146,8 +1146,18 @@ void rswitch_trigger_chain(struct rswitch_private *priv,
 {
 	if (!rswitch_is_front_priv(priv))
 		rswitch_modify(priv->addr, GWTRC0, 0, BIT(chain->index));
-	else
-		rswitch_vmq_front_trigger_tx(chain->rdev);
+	else {
+		struct rswitch_device *rdev = chain->rdev;
+		
+		if (!READ_ONCE(rdev->vmq_info->scheduled_tx)) {
+			uint64_t back_rx, front_tx;
+
+			back_rx = READ_ONCE(rdev->vmq_info->back_rx);
+			front_tx = READ_ONCE(rdev->vmq_info->front_tx);
+			if (back_rx < front_tx)
+				rswitch_vmq_front_trigger_tx(rdev);
+		}
+	}
 }
 
 static void rswitch_ack_data_irq(struct rswitch_private *priv, int index)
@@ -1329,7 +1339,6 @@ static bool rswitch_rx_chain(struct net_device *ndev, int *quota, struct rswitch
 		napi_gro_receive(&rdev->napi, skb);
 		rdev->ndev->stats.rx_packets++;
 		rdev->ndev->stats.rx_bytes += pkt_len;
-
 next:
 		if (rdev->is_vmq)
 			rx_counter++;

@@ -279,6 +279,7 @@ struct rswitch_vmq_status {
 	uint64_t back_tx, back_rx;
 	uint64_t tx_front_ring_size, rx_front_ring_size;
 	uint64_t tx_back_ring_size, rx_back_ring_size;
+	bool scheduled_tx;
 };
 
 struct rswitch_device {

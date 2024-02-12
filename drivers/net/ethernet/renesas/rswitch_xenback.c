@@ -46,8 +46,14 @@ struct rswitch_vmq_back_info {
 	enum rswtich_pv_type type;
 	int gref;
 	struct page *shared_page;
+	/* Used to periodically trigger DomU TX chain
+	 * from DomD to reduce the number of Xen events.
+	 */
+	struct hrtimer tx_trigger_hrttimer;
 };
 
+/* Optimal value to periodically trigger of DomU TX chain */
+static int tx_trigger_time_nsec = 200 * 1000;
 /* Optimal value between performance and event numbers for front devices */
 static u16 chain_irq_delay = 0x100;
 module_param(chain_irq_delay, ushort, 0);
@@ -144,6 +150,7 @@ static int rswitch_vmq_back_remove(struct xenbus_device *dev)
 		if (be->type == RSWITCH_PV_VMQ) {
 			struct gnttab_unmap_grant_ref unmap_op;
 
+			hrtimer_cancel(&be->tx_trigger_hrttimer);
 			gnttab_set_unmap_op(&unmap_op,
 			    		    (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((be->shared_page))),
 				  	    GNTMAP_host_map, be->gref);
@@ -372,11 +379,40 @@ static irqreturn_t rswitch_vmq_back_tx_interrupt(int irq, void *dev_id)
 {
 	struct rswitch_vmq_back_info *be = dev_id;
 
-	rswitch_trigger_chain(be->rswitch_priv, be->tx_chain);
+	if (be->rdev->is_vmq) {
+		if (!hrtimer_is_queued(&be->tx_trigger_hrttimer)) {
+			WRITE_ONCE(be->rdev->vmq_info->scheduled_tx, true);
+			hrtimer_start(&be->tx_trigger_hrttimer,
+				      tx_trigger_time_nsec,
+				      HRTIMER_MODE_REL_SOFT);
+		}
+	} else {
+		rswitch_trigger_chain(be->rdev->priv, be->tx_chain);
+	}
 
 	xen_irq_lateeoi(irq, 0);
 
 	return IRQ_HANDLED;
+}
+
+static enum hrtimer_restart trigger_front_tx_chain_hrt(struct hrtimer *hrtimer)
+{
+	struct rswitch_vmq_back_info *be = container_of(hrtimer,
+							struct rswitch_vmq_back_info,
+							tx_trigger_hrttimer);
+	struct rswitch_device *rdev = be->rdev;
+	uint64_t back_rxed, front_txed;
+
+	back_rxed = READ_ONCE(rdev->vmq_info->back_rx);
+	front_txed = READ_ONCE(rdev->vmq_info->front_tx);
+	if (back_rxed < front_txed) {
+		rswitch_trigger_chain(rdev->priv, be->tx_chain);
+		hrtimer_start(hrtimer, tx_trigger_time_nsec, HRTIMER_MODE_REL_SOFT);
+	} else {
+		WRITE_ONCE(rdev->vmq_info->scheduled_tx, false);
+	}
+
+	return HRTIMER_NORESTART;
 }
 
 
@@ -387,6 +423,7 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 	unsigned int rx_evt;
 	int err;
 	struct gnttab_map_grant_ref grant_map;
+	struct gnttab_unmap_grant_ref unmap_op;
 
 	err = xenbus_gather(XBT_NIL, dev->otherend,
 			    "tx-evtch", "%u", &tx_evt,
@@ -404,12 +441,40 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 	rswitch_gwca_chain_register(be->rswitch_priv, be->tx_chain, false);
 	rswitch_gwca_chain_register(be->rswitch_priv, be->rx_chain, true);
 
+	/* Timer and shared memory should be initialized before binding IRQ
+	 * handler because timer callback requires these structures.
+	 */
+	if (be->type == RSWITCH_PV_VMQ) {
+		err = gnttab_alloc_pages(1, &be->shared_page);
+		if (err) {
+			dev_err(&be->rdev->ndev->dev, "failed to allocate gnttab page (err=%d)\n", err);
+			return err;
+		}
+
+		gnttab_set_map_op(&grant_map,
+				  (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((be->shared_page))),
+				  GNTMAP_host_map, be->gref, dev->otherend_id);
+		err = gnttab_map_refs(&grant_map, NULL, &be->shared_page, 1);
+		if (err) {
+			dev_err(&be->rdev->ndev->dev, "failed to map grant refs %d\n", err);
+			goto err_gnttab_free_page;
+		}
+
+		be->rdev->vmq_info = (struct rswitch_vmq_status *)page_address(be->shared_page);
+		WRITE_ONCE(be->rdev->vmq_info->back_tx, 0);
+		WRITE_ONCE(be->rdev->vmq_info->back_rx, 0);
+		WRITE_ONCE(be->rdev->vmq_info->tx_back_ring_size, RX_RING_SIZE);
+		WRITE_ONCE(be->rdev->vmq_info->rx_back_ring_size, TX_RING_SIZE);
+		hrtimer_init(&be->tx_trigger_hrttimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+		be->tx_trigger_hrttimer.function = trigger_front_tx_chain_hrt;
+	}
+
 	err = bind_interdomain_evtchn_to_irqhandler_lateeoi(dev->otherend_id,
 		tx_evt, rswitch_vmq_back_tx_interrupt, 0,
 		be->name, be);
 	if (err < 0) {
 		xenbus_dev_fatal(dev, err, "Failed to bind tx_evt IRQ: %d", err);
-		return err;
+		goto err_unmap_refs;
 	}
 	be->tx_irq = err;
 
@@ -433,27 +498,6 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 			dev_err(&dev->dev, "failed to register ndev\n");
 			goto err_unbind_rx_evt;
 		}
-
-		err = gnttab_alloc_pages(1, &be->shared_page);
-		if (err) {
-			dev_err(&be->rdev->ndev->dev, "failed to allocate gnttab page (err=%d)\n", err);
-			goto err_unregister_ndev;
-		}
-
-		gnttab_set_map_op(&grant_map,
-				  (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((be->shared_page))),
-				  GNTMAP_host_map, be->gref, dev->otherend_id);
-		err = gnttab_map_refs(&grant_map, NULL, &be->shared_page, 1);
-		if (err) {
-			dev_err(&be->rdev->ndev->dev, "failed to map grant refs %d\n", err);
-			goto err_gnttab_free_page;
-		}
-
-		be->rdev->vmq_info = (struct rswitch_vmq_status *)page_address(be->shared_page);
-		WRITE_ONCE(be->rdev->vmq_info->back_tx, 0);
-		WRITE_ONCE(be->rdev->vmq_info->back_rx, 0);
-		WRITE_ONCE(be->rdev->vmq_info->tx_back_ring_size, RX_RING_SIZE);
-		WRITE_ONCE(be->rdev->vmq_info->rx_back_ring_size, TX_RING_SIZE);
 		break;
 	case RSWITCH_PV_TSN:
 		rswitch_mfwd_set_port_based(be->rswitch_priv, be->if_num, be->rx_chain);
@@ -467,16 +511,19 @@ static int rswitch_vmq_back_connect(struct xenbus_device *dev)
 
 	return err;
 
-err_gnttab_free_page:
-	gnttab_free_pages(1, &be->shared_page);
-err_unregister_ndev:
-	rswitch_ndev_unregister(be->rdev, -1);
 err_unbind_rx_evt:
 	unbind_from_irqhandler(be->rx_irq, be);
 	be->rx_irq = 0;
 err_unbind_tx_evt:
 	unbind_from_irqhandler(be->tx_irq, be);
 	be->tx_irq = 0;
+err_unmap_refs:
+	gnttab_set_unmap_op(&unmap_op,
+			    (uintptr_t)pfn_to_kaddr(page_to_xen_pfn((be->shared_page))),
+			    GNTMAP_host_map, be->gref);
+	gnttab_unmap_refs(&unmap_op, NULL, &be->shared_page, 1);
+err_gnttab_free_page:
+	gnttab_free_pages(1, &be->shared_page);
 
 	return err;
 }
