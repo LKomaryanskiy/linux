@@ -402,8 +402,109 @@ static struct platform_driver pcie6_rcar_host_driver = {
 	},
 	.probe = pcie6_rcar_host_probe,
 };
+
+#include <linux/notifier.h>
+ 
+#include <xen/xen.h>
+#include <xen/interface/physdev.h>
+ 
+#include <asm/xen/hypercall.h>
+#include <asm/xen/hypervisor.h>
+
+static inline bool xt_pci_ari_enabled(struct pci_bus *bus)
+{
+	return bus->self && bus->self->ari_enabled;
+}
+ 
+static int xt_xen_add_device(struct device *dev)
+{
+	struct pci_dev *pci_dev = to_pci_dev(dev);
+	struct {
+		struct physdev_pci_device_add add;
+		uint32_t opt0;
+	} add_ext = {
+		.add.seg   = pci_domain_nr(pci_dev->bus),
+		.add.bus   = pci_dev->bus->number,
+		.add.devfn = pci_dev->devfn,
+	};
+	struct physdev_pci_device_add *add = &add_ext.add;
+ 
+#ifdef CONFIG_PCI_IOV
+	if (pci_dev->is_virtfn) {
+		struct pci_dev *physfn = pci_dev->physfn;
+ 
+		add->flags = XEN_PCI_DEV_VIRTFN;
+		add->physfn.bus = physfn->bus->number;
+		add->physfn.devfn = physfn->devfn;
+	} else
+#endif
+	if (xt_pci_ari_enabled(pci_dev->bus) && PCI_SLOT(pci_dev->devfn))
+		add->flags = XEN_PCI_DEV_EXTFN;
+ 
+	return HYPERVISOR_physdev_op(PHYSDEVOP_pci_device_add, add);
+}
+ 
+static int xt_xen_remove_device(struct device *dev)
+{
+	struct pci_dev *pci_dev = to_pci_dev(dev);
+	struct physdev_pci_device device = {
+		.seg   = pci_domain_nr(pci_dev->bus),
+		.bus   = pci_dev->bus->number,
+		.devfn = pci_dev->devfn,
+	};
+ 
+	return HYPERVISOR_physdev_op(PHYSDEVOP_pci_device_remove, &device);
+}
+ 
+static int xt_xen_pci_notify(struct notifier_block *nb, unsigned long action,
+			     void *data)
+{
+	struct device *dev = data;
+	int r = 0;
+
+	switch (action) {
+	case BUS_NOTIFY_ADD_DEVICE:
+		r = xt_xen_add_device(dev);
+		break;
+	case BUS_NOTIFY_DEL_DEVICE:
+		r = xt_xen_remove_device(dev);
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
+
+	if (r)
+		dev_err(dev, "Failed to %s - passthrough or MSI/MSI-X might fail!\n",
+			action == BUS_NOTIFY_ADD_DEVICE ? "add" :
+			(action == BUS_NOTIFY_DEL_DEVICE ? "delete" : "?"));
+
+	return NOTIFY_OK;
+}
+ 
+static struct notifier_block xt_pci_nb = {
+	.notifier_call = xt_xen_pci_notify,
+};
+
+static int rcar_gen5_xen_register_notifier(void)
+{
+	/* Just sanity check for Dom0, where notifier will be registered originally */
+	if (xen_initial_domain())
+		return 0;
+
+	return bus_register_notifier(&pci_bus_type, &xt_pci_nb);
+}
+
+
 static int __init pcie6_rcar_init(void)
 {
+	int ret;
+	/* Register notifier as earlier as possible */
+	ret = rcar_gen5_xen_register_notifier();
+	if (ret)
+		return ret;
+	else
+		pr_err("=============== >>> rcar_gen5_xen_register_notifier is registered!");
+
 	return platform_driver_register(&pcie6_rcar_host_driver);
 }
 
